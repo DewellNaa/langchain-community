@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -52,7 +53,6 @@ from langchain_core.output_parsers.openai_tools import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
 from langchain_core.tools import BaseTool
-from langchain_core.utils import get_from_dict_or_env
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -61,9 +61,54 @@ logger = logging.getLogger(__name__)
 API_TOKEN_TTL_SECONDS = 3 * 60
 ZHIPUAI_API_BASE = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
+API_KEY_ENV_VARS = ("ZHIPUAI_API_KEY", "BIGMODEL_API_KEY", "ZAI_API_KEY")
+"""Environment variables that may hold the API key, in order of precedence."""
+
+API_BASE_ENV_VARS = ("ZHIPUAI_API_BASE", "BIGMODEL_API_BASE", "ZAI_API_BASE")
+"""Environment variables that may hold the API base URL, in order of precedence."""
+
 
 def _is_pydantic_class(obj: Any) -> bool:
     return isinstance(obj, type) and issubclass(obj, BaseModel)
+
+
+def _get_from_dict_or_envs(
+    data: Dict[str, Any],
+    keys: Sequence[str],
+    env_vars: Sequence[str],
+    default: Optional[str] = None,
+) -> str:
+    """Get a value from a dict or the first matching environment variable.
+
+    Unlike ``get_from_dict_or_env`` from langchain_core, this supports
+    multiple fallback environment variables.
+
+    Args:
+        data: The dictionary (model constructor kwargs) to look up keys in.
+        keys: The dict keys to try, in order of precedence.
+        env_vars: The environment variables to try, in order of precedence.
+        default: The default value to return if no key or env var matches.
+
+    Returns:
+        The resolved value.
+
+    Raises:
+        ValueError: If no value is found and no default is provided.
+    """
+    for key in keys:
+        if value := data.get(key):
+            return str(value)
+    for env_var in env_vars:
+        if value := os.getenv(env_var):
+            return value
+    if default is not None:
+        return default
+    msg = (
+        f"Did not find {keys[0]}, please add an environment variable"
+        f" `{env_vars[0]}` which contains it, or pass"
+        f" `{keys[0]}` as a named parameter."
+    )
+    raise ValueError(msg)
 
 
 @contextmanager
@@ -155,6 +200,9 @@ def _convert_dict_to_message(dct: Dict[str, Any]) -> BaseMessage:
         tool_calls = dct.get("tool_calls", None)
         if tool_calls is not None:
             additional_kwargs["tool_calls"] = tool_calls
+        reasoning_content = dct.get("reasoning_content", None)
+        if reasoning_content is not None:
+            additional_kwargs["reasoning_content"] = reasoning_content
         return AIMessage(content=content, additional_kwargs=additional_kwargs)
     if role == "tool":
         additional_kwargs = {}
@@ -207,6 +255,9 @@ def _convert_delta_to_message_chunk(
     tool_calls = dct.get("tool_calls", None)
     if tool_calls is not None:
         additional_kwargs["tool_calls"] = tool_calls
+    reasoning_content = dct.get("reasoning_content", None)
+    if reasoning_content is not None:
+        additional_kwargs["reasoning_content"] = reasoning_content
 
     if role == "system" or default_class == SystemMessageChunk:
         return SystemMessageChunk(content=content)
@@ -238,6 +289,7 @@ class ChatZhipuAI(BaseChatModel):
 
     Setup:
         Install ``PyJWT`` and set environment variable ``ZHIPUAI_API_KEY``
+        (or ``BIGMODEL_API_KEY`` / ``ZAI_API_KEY``)
 
         .. code-block:: bash
 
@@ -403,6 +455,17 @@ class ChatZhipuAI(BaseChatModel):
               'model_name': 'glm-4',
               'finish_reason': 'stop'}
 
+    Reasoning models:
+        Thinking models (e.g. GLM-4.5, GLM-Zero, or DeepSeek hosted on ZhipuAI)
+        return a ``reasoning_content`` field alongside ``content``. It is preserved
+        on the ``AIMessage`` under ``additional_kwargs["reasoning_content"]`` and
+        accumulated across chunks when streaming.
+
+        .. code-block:: python
+
+            ai_msg = zhipuai_chat.invoke(messages)
+            ai_msg.additional_kwargs["reasoning_content"]
+
     """  # noqa: E501
 
     @property
@@ -442,10 +505,13 @@ class ChatZhipuAI(BaseChatModel):
 
     # client:
     zhipuai_api_key: Optional[str] = Field(default=None, alias="api_key")
-    """Automatically inferred from env var `ZHIPUAI_API_KEY` if not provided."""
+    """Automatically inferred from env vars `ZHIPUAI_API_KEY`, `BIGMODEL_API_KEY`
+    or `ZAI_API_KEY` (checked in that order) if not provided."""
     zhipuai_api_base: Optional[str] = Field(default=None, alias="api_base")
     """Base URL path for API requests, leave blank if not using a proxy or service
-        emulator.
+        emulator. Automatically inferred from env vars `ZHIPUAI_API_BASE`,
+        `BIGMODEL_API_BASE` or `ZAI_API_BASE` (checked in that order); defaults to
+        the ZhipuAI open platform URL if none is set.
     """
 
     model_name: Optional[str] = Field(default="glm-4", alias="model")
@@ -487,11 +553,14 @@ class ChatZhipuAI(BaseChatModel):
     @model_validator(mode="before")
     @classmethod
     def validate_environment(cls, values: Dict[str, Any]) -> Any:
-        values["zhipuai_api_key"] = get_from_dict_or_env(
-            values, ["zhipuai_api_key", "api_key"], "ZHIPUAI_API_KEY"
+        values["zhipuai_api_key"] = _get_from_dict_or_envs(
+            values, ["zhipuai_api_key", "api_key"], API_KEY_ENV_VARS
         )
-        values["zhipuai_api_base"] = get_from_dict_or_env(
-            values, "zhipuai_api_base", "ZHIPUAI_API_BASE", default=ZHIPUAI_API_BASE
+        values["zhipuai_api_base"] = _get_from_dict_or_envs(
+            values,
+            ["zhipuai_api_base", "api_base"],
+            API_BASE_ENV_VARS,
+            default=ZHIPUAI_API_BASE,
         )
 
         return values
